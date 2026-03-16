@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Users/nicholas/Documents/Tools/print-proxy-prep/venv/bin/python:*)",
+      "Bash(/Users/nicholas/Documents/Tools/print-proxy-prep/venv/bin/pip index:*)",
+      "Bash(/Users/nicholas/Documents/Tools/print-proxy-prep/venv/bin/pip install:*)"
+    ]
+  }
+}

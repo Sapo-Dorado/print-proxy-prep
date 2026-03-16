@@ -8,7 +8,7 @@ import configparser
 import io
 import re
 from PIL import Image, ImageFilter
-import PySimpleGUI as sg
+import FreeSimpleGUI as sg
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter, A4, legal
 
@@ -56,7 +56,7 @@ def grey_out(main_window):
         location=main_window.current_location(more_accurate=True),
         finalize=True,
     )
-    the_grey.disable()
+    the_grey.TKroot.grab_set()
     the_grey.refresh()
     return the_grey
 
@@ -424,7 +424,6 @@ while True:
 
     if "CROP" in event:
         oldwindow = window
-        oldwindow.disable()
         grey_window = grey_out(window)
 
         img_dict = cropper(image_dir, img_dict)
@@ -434,7 +433,6 @@ while True:
                 print_dict["cards"][img] = 1
                 
         window = window_setup(print_dict["columns"])
-        window.enable()
         window.bring_to_front()
         oldwindow.close()
         grey_window.close()
@@ -445,7 +443,6 @@ while True:
                 window[k].bind("<Button-3>", "-RIGHT")
 
     if "RENDER" in event:
-        window.disable()
         grey_window = grey_out(window)
         render_window = popup("Rendering...")
         render_window.refresh()
@@ -453,7 +450,6 @@ while True:
         pdf_gen(print_dict, lookup[print_dict["pagesize"]])
         render_window.close()
         grey_window.close()
-        window.enable()
         window.bring_to_front()
         window.refresh()
 
