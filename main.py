@@ -7,6 +7,7 @@ import subprocess
 import configparser
 import io
 import re
+import shutil
 from PIL import Image, ImageFilter
 import FreeSimpleGUI as sg
 from reportlab.pdfgen import canvas
@@ -36,7 +37,8 @@ image_dir = os.path.join(cwd, "images")
 crop_dir = os.path.join(image_dir, "crop")
 print_json = os.path.join(cwd, "print.json")
 img_cache = os.path.join(cwd, "img.cache")
-for folder in [image_dir, crop_dir]:
+past_prints_dir = os.path.join(cwd, "PastPrints")
+for folder in [image_dir, crop_dir, past_prints_dir]:
     if not os.path.exists(folder):
         os.mkdir(folder)
 
@@ -120,6 +122,11 @@ def pdf_gen(p_dict, size):
     saving_window.refresh()
     pages.save()
     saving_window.close()
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    pdf_basename = os.path.basename(pdf_fp)
+    pdf_name, pdf_ext = os.path.splitext(pdf_basename)
+    archive_fp = os.path.join(past_prints_dir, f"{pdf_name}_{timestamp}{pdf_ext}")
+    shutil.copy2(pdf_fp, archive_fp)
     try:
         subprocess.Popen([pdf_fp], shell=True)
     except Exception as e:
@@ -274,6 +281,19 @@ def img_frames_refresh(max_cols):
     )
 
 
+def clear_project():
+    global img_dict
+    if os.path.exists(print_json):
+        os.remove(print_json)
+    if os.path.exists(img_cache):
+        os.remove(img_cache)
+    if os.path.exists(image_dir):
+        shutil.rmtree(image_dir)
+    os.makedirs(crop_dir)
+    img_dict = {}
+    print_dict["cards"] = {}
+
+
 def window_setup(cols):
     column_layout = [
         [
@@ -314,6 +334,7 @@ def window_setup(cols):
             sg.Button(button_text=" Run Cropper ", size=(10, 1), key="CROP"),
             sg.Button(button_text=" Save Project ", size=(10, 1), key="SAVE"),
             sg.Button(button_text=" Render PDF ", size=(10, 1), key="RENDER"),
+            sg.Button(button_text=" Reset ", size=(10, 1), key="RESET"),
         ],
         [
             sg.Frame(
@@ -449,9 +470,23 @@ while True:
         lookup = {"Letter": letter, "A4": A4, "Legal": legal}
         pdf_gen(print_dict, lookup[print_dict["pagesize"]])
         render_window.close()
+        clear_project()
         grey_window.close()
         window.bring_to_front()
         window.refresh()
+
+    if "RESET" in event:
+        if sg.popup_yes_no("Clear all images and project data?", title="Reset") == "Yes":
+            clear_project()
+            oldwindow = window
+            window = window_setup(print_dict["columns"])
+            window.bring_to_front()
+            oldwindow.close()
+            window.refresh()
+            for k in window.key_dict.keys():
+                if "CRD:" in str(k):
+                    window[k].bind("<Button-1>", "-LEFT")
+                    window[k].bind("<Button-3>", "-RIGHT")
 
     if event and print_dict["size"] != window.size:
         print_dict["size"] = window.size
