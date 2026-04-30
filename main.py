@@ -435,8 +435,14 @@ def main():
     # 4. Crop / process
     id_to_crop = crop_all(id_to_cached, args.dpi, args.vibrance)
 
+    # 4b. Crop cardback through same pipeline
+    os.makedirs(CROP_DIR, exist_ok=True)
+    vibrance_lut = load_vibrance_lut() if args.vibrance else None
+    ext = os.path.splitext(cardback_path)[1]
+    cropped_cardback = crop_image(cardback_path, "cardback", ext, args.dpi, vibrance_lut)
+
     # 5. Build slot list
-    slot_list = build_slot_list(fronts, backs, cardback_path, id_to_crop)
+    slot_list = build_slot_list(fronts, backs, cropped_cardback, id_to_crop)
     print(f"Total slots: {len(slot_list)}")
 
     # 6. Generate PDFs
