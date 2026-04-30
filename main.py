@@ -1,68 +1,316 @@
+#!/usr/bin/env python3
+"""CLI tool for preparing print-ready proxy card PDFs from XML order files."""
+
+import argparse
 import os
-import math
-import json
-import time
-import base64
-import subprocess
-import configparser
-import io
-import re
+import random
 import shutil
+import sys
+import time
+import xml.etree.ElementTree as ET
+
 from PIL import Image, ImageFilter
-import FreeSimpleGUI as sg
-from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter, A4, legal
+from reportlab.lib.units import inch
+from reportlab.pdfgen import canvas
 
-sw, sh = sg.Window.get_screen_size()
-sg.theme("DarkTeal2")
+# ---------------------------------------------------------------------------
+# Paths relative to this script
+# ---------------------------------------------------------------------------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+IMAGE_DIR = os.path.join(SCRIPT_DIR, "images")
+CACHE_DIR = os.path.join(IMAGE_DIR, "cache")
+CROP_DIR = os.path.join(IMAGE_DIR, "crop")
+VIBRANCE_CUBE = os.path.join(SCRIPT_DIR, "vibrance.CUBE")
 
-def popup(middle_text):
-    return sg.Window(
-        middle_text,
-        [
-            [sg.Sizer(v_pixels=20)],
-            [sg.Sizer(h_pixels=20), sg.Text(middle_text), sg.Sizer(h_pixels=20)],
-            [sg.Sizer(v_pixels=20)],
-        ],
-        no_titlebar=True,
-        finalize=True,
+PAGE_SIZES = {
+    "letter": letter,
+    "a4": A4,
+    "legal": legal,
+}
+
+CARD_W = 2.48 * 72  # points
+CARD_H = 3.46 * 72  # points
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Prepare print-ready proxy card PDFs from an XML order file."
     )
-
-
-loading_window = popup("Loading...")
-loading_window.refresh()
-
-cwd = os.path.dirname(__file__)
-image_dir = os.path.join(cwd, "images")
-crop_dir = os.path.join(image_dir, "crop")
-print_json = os.path.join(cwd, "print.json")
-img_cache = os.path.join(cwd, "img.cache")
-past_prints_dir = os.path.join(cwd, "PastPrints")
-for folder in [image_dir, crop_dir, past_prints_dir]:
-    if not os.path.exists(folder):
-        os.mkdir(folder)
-
-config = configparser.ConfigParser()
-config.read(os.path.join(cwd, "config.ini"))
-cfg = config["DEFAULT"]
-
-def grey_out(main_window):
-    the_grey = sg.Window(
-        title="",
-        layout=[[]],
-        alpha_channel=0.6,
-        titlebar_background_color="#888888",
-        background_color="#888888",
-        size=main_window.size,
-        disable_close=True,
-        location=main_window.current_location(more_accurate=True),
-        finalize=True,
+    parser.add_argument(
+        "xml_file",
+        nargs="?",
+        default=None,
+        help="Path to the XML order file",
     )
-    the_grey.TKroot.grab_set()
-    the_grey.refresh()
-    return the_grey
+    parser.add_argument(
+        "-o", "--output",
+        default="./output",
+        help="Base output directory (default: ./output)",
+    )
+    parser.add_argument(
+        "--paper",
+        choices=["letter", "a4", "legal"],
+        default="letter",
+        help="Page size (default: letter)",
+    )
+    parser.add_argument(
+        "--orientation",
+        choices=["portrait", "landscape"],
+        default="portrait",
+        help="Page orientation (default: portrait)",
+    )
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=1200,
+        help="Max DPI before downscaling (default: 1200)",
+    )
+    parser.add_argument(
+        "--vibrance",
+        action="store_true",
+        help="Apply vibrance LUT",
+    )
+    parser.add_argument(
+        "--cardback",
+        default=None,
+        help="Path to a custom cardback image (overrides the default)",
+    )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Delete cached images. If no xml_file given, just clear and exit.",
+    )
+    return parser
 
 
+# ---------------------------------------------------------------------------
+# XML parsing
+# ---------------------------------------------------------------------------
+def parse_xml(xml_path):
+    """Return (fronts, backs).
+
+    fronts: list of dicts  {id, slots: [int, ...], name}
+    backs:  list of dicts  {id, slots: [int, ...], name}
+    """
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    def parse_cards(section):
+        cards = []
+        node = root.find(section)
+        if node is None:
+            return cards
+        for card_el in node.findall("card"):
+            cid = card_el.findtext("id").strip()
+            slots_text = card_el.findtext("slots").strip()
+            slots = [int(s.strip()) for s in slots_text.split(",")]
+            name = card_el.findtext("name").strip()
+            cards.append({"id": cid, "slots": slots, "name": name})
+        return cards
+
+    fronts = parse_cards("fronts")
+    backs = parse_cards("backs")
+
+    return fronts, backs
+
+
+# ---------------------------------------------------------------------------
+# Downloading
+# ---------------------------------------------------------------------------
+def extension_from_name(name):
+    _, ext = os.path.splitext(name)
+    return ext  # includes the dot
+
+
+def download_image(drive_id, name):
+    """Download a Google Drive file into CACHE_DIR if not already cached.
+
+    Returns the cached file path, or None if download failed.
+    """
+    ext = extension_from_name(name)
+    cached_path = os.path.join(CACHE_DIR, drive_id + ext)
+    if os.path.exists(cached_path):
+        return cached_path
+
+    import gdown
+
+    url = f"https://drive.google.com/uc?id={drive_id}"
+    print(f"Downloading {name}...")
+    try:
+        gdown.download(url, cached_path, quiet=True)
+    except Exception as e:
+        # Clean up partial download
+        if os.path.exists(cached_path):
+            os.remove(cached_path)
+        print(f"  Error downloading {name}: {e}")
+        return None
+    return cached_path
+
+
+def download_all(fronts, backs):
+    """Download every unique image referenced in the order.
+
+    Returns a dict mapping drive_id -> cached_file_path.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    # Collect unique (id, name) pairs – need name for extension
+    unique = {}
+    for card in fronts:
+        unique[card["id"]] = card["name"]
+    for card in backs:
+        unique[card["id"]] = card["name"]
+
+    id_to_path = {}
+    failed = []
+    items = list(unique.items())
+    need_download = [(did, n) for did, n in items
+                     if not os.path.exists(os.path.join(CACHE_DIR, did + extension_from_name(n)))]
+    cached_count = len(items) - len(need_download)
+    if cached_count > 0:
+        print(f"  {cached_count} image(s) already cached, {len(need_download)} to download")
+
+    for i, (drive_id, name) in enumerate(items):
+        path = download_image(drive_id, name)
+        if path is not None:
+            id_to_path[drive_id] = path
+        else:
+            failed.append((drive_id, name))
+
+        # Delay between actual downloads to avoid Google Drive rate limiting
+        if i < len(items) - 1 and (drive_id, name) in need_download:
+            delay = 1.5 + random.uniform(0, 1)
+            time.sleep(delay)
+
+    # Retry failed downloads once after a longer pause
+    if failed:
+        print(f"\nRetrying {len(failed)} failed download(s) after pause...")
+        time.sleep(10)
+        still_failed = []
+        for i, (drive_id, name) in enumerate(failed):
+            path = download_image(drive_id, name)
+            if path is not None:
+                id_to_path[drive_id] = path
+            else:
+                still_failed.append(name)
+            if i < len(failed) - 1:
+                time.sleep(2 + random.uniform(0, 1.5))
+        failed = still_failed
+
+    if failed:
+        print(f"\nFailed to download {len(failed)} image(s):")
+        for name in failed:
+            print(f"  - {name}")
+        print("Cards using these images will be skipped.\n")
+
+    return id_to_path
+
+
+# ---------------------------------------------------------------------------
+# Cropping / processing
+# ---------------------------------------------------------------------------
+def load_vibrance_lut():
+    with open(VIBRANCE_CUBE) as f:
+        lut_raw = f.read().splitlines()[11:]
+    lsize = round(len(lut_raw) ** (1 / 3))
+    lut_table = [tuple(float(v) for v in row.split(" ")) for row in lut_raw]
+    return ImageFilter.Color3DLUT(lsize, lut_table)
+
+
+def crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut):
+    """Crop, downscale, apply LUT, and save into CROP_DIR.
+
+    Returns the crop file path.
+    """
+    # If no extension, detect format from file header
+    if not ext:
+        with Image.open(cached_path) as probe:
+            fmt = probe.format or "PNG"
+        ext = f".{fmt.lower()}"
+
+    crop_path = os.path.join(CROP_DIR, drive_id + ext)
+    if os.path.exists(crop_path):
+        return crop_path
+
+    with Image.open(cached_path) as im:
+        w, h = im.size
+        c = round(0.12 * min(w / 2.72, h / 3.7))
+        dpi = c * (1 / 0.12)
+        print(f"  Cropping {os.path.basename(cached_path)} – DPI: {dpi:.0f}, bleed: {c}px")
+        crop_im = im.crop((c, c, w - c, h - c))
+
+        if dpi > max_dpi:
+            scale = max_dpi / dpi
+            crop_im = crop_im.resize(
+                (int(round(crop_im.size[0] * scale)),
+                 int(round(crop_im.size[1] * scale))),
+                Image.Resampling.BICUBIC,
+            )
+            crop_im = crop_im.filter(ImageFilter.UnsharpMask(1, 20, 8))
+
+        if vibrance_lut is not None:
+            crop_im = crop_im.filter(vibrance_lut)
+
+        crop_im.save(crop_path, quality=98)
+
+    return crop_path
+
+
+def crop_all(id_to_cached, max_dpi, vibrance):
+    """Process every cached image. Returns dict drive_id -> crop_path."""
+    os.makedirs(CROP_DIR, exist_ok=True)
+
+    vibrance_lut = load_vibrance_lut() if vibrance else None
+
+    print("Cropping images...")
+    id_to_crop = {}
+    for drive_id, cached_path in id_to_cached.items():
+        ext = os.path.splitext(cached_path)[1]
+        id_to_crop[drive_id] = crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut)
+
+    return id_to_crop
+
+
+# ---------------------------------------------------------------------------
+# Slot list
+# ---------------------------------------------------------------------------
+def build_slot_list(fronts, backs, cardback_path, id_to_crop):
+    """Return sorted list of (slot_num, front_crop_path, back_crop_path)."""
+    # Map slot -> front crop path (skip cards with failed downloads)
+    slot_front = {}
+    for card in fronts:
+        if card["id"] not in id_to_crop:
+            continue
+        crop_path = id_to_crop[card["id"]]
+        for s in card["slots"]:
+            slot_front[s] = crop_path
+
+    # Map slot -> custom back crop path
+    slot_back = {}
+    for card in backs:
+        if card["id"] not in id_to_crop:
+            continue
+        crop_path = id_to_crop[card["id"]]
+        for s in card["slots"]:
+            slot_back[s] = crop_path
+
+    default_back = cardback_path
+
+    slots = []
+    for slot_num in sorted(slot_front.keys()):
+        back_path = slot_back.get(slot_num, default_back)
+        slots.append((slot_num, slot_front[slot_num], back_path))
+
+    return slots
+
+
+# ---------------------------------------------------------------------------
+# PDF generation
+# ---------------------------------------------------------------------------
 def draw_cross(can, x, y, c=6, s=1):
     dash = [s, s]
     can.setLineWidth(s)
@@ -78,419 +326,145 @@ def draw_cross(can, x, y, c=6, s=1):
     can.line(x, y - c, x, y + c)
 
 
-def pdf_gen(p_dict, size):
-    rgx = re.compile(r"\W")
-    img_dict = p_dict["cards"]
-    w, h = 2.48 * 72, 3.46 * 72
-    rotate = bool(p_dict["orient"] == "Landscape")
-    size = tuple(size[::-1]) if rotate else size
-    pw, ph = size
-    pdf_fp = os.path.join(
-        cwd,
-        f"{re.sub(rgx, '', p_dict['filename'])}.pdf"
-        if len(p_dict["filename"]) > 0
-        else "_printme.pdf",
-    )
-    pages = canvas.Canvas(pdf_fp, pagesize=size)
-    cols, rows = int(pw // w), int(ph // h)
-    rx, ry = round((pw - (w * cols)) / 2), round((ph - (h * rows)) / 2)
-    total_cards = sum(img_dict.values())
-    pbreak = cols * rows
-    i = 0
-    for img in img_dict.keys():
-        img_path = os.path.join(crop_dir, img)
-        for n in range(img_dict[img]):
-            p, j = divmod(i, pbreak)
-            y, x = divmod(j, cols)
-            if j == 0 and i > 0:
-                pages.showPage()
-            pages.drawImage(
-                img_path,
-                x * w + rx,
-                y * h + ry,
-                w,
-                h,
-            )
-            if j == pbreak - 1 or i == total_cards - 1:
-                # Draw lines
-                cross = 6
-                for cy in range(rows + 1):
-                    for cx in range(cols + 1):
-                        draw_cross(pages, rx + w * cx, ry + h * cy)
-            i += 1
-    saving_window = popup("Saving...")
-    saving_window.refresh()
+def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts"):
+    """Generate a PDF of card images laid out on pages.
+
+    side: 'fronts' or 'backs'
+    """
+    if orientation == "landscape":
+        page_size = (page_size[1], page_size[0])
+
+    pw, ph = page_size
+    cols = int(pw // CARD_W)
+    rows = int(ph // CARD_H)
+    rx = round((pw - (CARD_W * cols)) / 2)
+    ry = round((ph - (CARD_H * rows)) / 2)
+    cards_per_page = cols * rows
+
+    pages = canvas.Canvas(pdf_path, pagesize=page_size)
+
+    total = len(slot_list)
+    for i, (slot_num, front_path, back_path) in enumerate(slot_list):
+        img_path = front_path if side == "fronts" else back_path
+        j = i % cards_per_page
+        row, col = divmod(j, cols)
+
+        if side == "backs":
+            col = cols - 1 - col
+
+        if j == 0 and i > 0:
+            pages.showPage()
+
+        pages.drawImage(
+            img_path,
+            col * CARD_W + rx,
+            row * CARD_H + ry,
+            CARD_W,
+            CARD_H,
+        )
+
+        # Draw crop marks on last card of a page or last card overall
+        if j == cards_per_page - 1 or i == total - 1:
+            for cy in range(rows + 1):
+                for cx in range(cols + 1):
+                    draw_cross(pages, rx + CARD_W * cx, ry + CARD_H * cy)
+
     pages.save()
-    saving_window.close()
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    pdf_basename = os.path.basename(pdf_fp)
-    pdf_name, pdf_ext = os.path.splitext(pdf_basename)
-    archive_fp = os.path.join(past_prints_dir, f"{pdf_name}_{timestamp}{pdf_ext}")
-    shutil.copy2(pdf_fp, archive_fp)
-    try:
-        subprocess.Popen([pdf_fp], shell=True)
-    except Exception as e:
-        print(e)
 
 
-def cropper(folder, img_dict):
-    if cfg.getboolean("Vibrance.Bump"):
-        with open(os.path.join(cwd, "vibrance.CUBE")) as f:
-            lut_raw = f.read().splitlines()[11:]
-        lsize = round(len(lut_raw) ** (1 / 3))
-        row2val = lambda row: tuple([float(val) for val in row.split(" ")])
-        lut_table = [row2val(row) for row in lut_raw]
-        lut = ImageFilter.Color3DLUT(lsize, lut_table)
-    i = 0
-    if not os.path.exists(crop_dir):
-        os.mkdir(crop_dir)
-    for img_file in os.listdir(folder):
-        if (
-            os.path.splitext(img_file)[1] not in [".gif", ".jpg", ".jpeg", ".png"]
-            or os.path.isdir(img_file)
-            or os.path.exists(os.path.join(folder, "crop", img_file))
-        ):
-            continue
-        with Image.open(os.path.join(folder, img_file)) as im:
-            i += 1
-            w, h = im.size
-            c = round(0.12 * min(w / 2.72, h / 3.7))
-            dpi = c*(1/0.12)
-            print(
-                f"{img_file} - DPI calculated: {dpi}, cropping {c} pixels around frame"
-            )
-            crop_im = im.crop((c, c, w - c, h - c))
-            if dpi > cfg.getint("Max.DPI"):
-                crop_im = crop_im.resize(
-                    (
-                        int(round(crop_im.size[0]*cfg.getint("Max.DPI")/dpi)),
-                        int(round(crop_im.size[1]*cfg.getint("Max.DPI")/dpi)),
-                    ),
-                    Image.Resampling.BICUBIC,
-                )
-                crop_im = crop_im.filter(ImageFilter.UnsharpMask(1, 20, 8))
-            if cfg.getboolean("Vibrance.Bump"):
-                crop_im = crop_im.filter(lut)
-            crop_im.save(os.path.join(crop_dir, img_file), quality=98)
-    return cache_previews(img_cache, crop_dir) if i>0 else img_dict
+# ---------------------------------------------------------------------------
+# Clear cache
+# ---------------------------------------------------------------------------
+def clear_cache():
+    """Remove cached and cropped images."""
+    for d in [CACHE_DIR, CROP_DIR]:
+        if os.path.exists(d):
+            shutil.rmtree(d)
+            print(f"Cleared {d}")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(CROP_DIR, exist_ok=True)
 
 
-def to_bytes(file_or_bytes, resize=None):
-    """
-    Will convert into bytes and optionally resize an image that is a file or a base64 bytes object.
-    Turns into PNG format in the process so that can be displayed by tkinter
-    :param file_or_bytes: either a string filename or a bytes base64 image object
-    :param resize:  optional new size
-    :return: (bytes) a byte-string object
-    """
-    if isinstance(file_or_bytes, str):
-        img = Image.open(file_or_bytes)
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Validate: need at least one of xml_file or --clear-cache
+    if not args.xml_file and not args.clear_cache:
+        parser.print_usage()
+        sys.exit(1)
+
+    # Handle --clear-cache
+    if args.clear_cache:
+        clear_cache()
+        if not args.xml_file:
+            print("Cache cleared. No XML file provided; exiting.")
+            return
+
+    # --- Normal run ---
+    xml_path = args.xml_file
+    if not os.path.isfile(xml_path):
+        print(f"Error: XML file not found: {xml_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # 1. Parse XML
+    print(f"Parsing {xml_path}...")
+    fronts, backs = parse_xml(xml_path)
+    print(f"  {len(fronts)} front card entries, {len(backs)} back card entries")
+
+    # 2. Resolve cardback image
+    if args.cardback:
+        cardback_path = os.path.abspath(args.cardback)
+        if not os.path.isfile(cardback_path):
+            print(f"Error: cardback image not found: {cardback_path}", file=sys.stderr)
+            sys.exit(1)
     else:
-        try:
-            img = Image.open(io.BytesIO(base64.b64decode(file_or_bytes)))
-        except Exception as e:
-            dataBytesIO = io.BytesIO(file_or_bytes)
-            img = Image.open(dataBytesIO)
+        cardback_path = os.path.join(SCRIPT_DIR, "cardback.jpg")
+        if not os.path.isfile(cardback_path):
+            print("Error: default cardback.jpg not found in project directory.", file=sys.stderr)
+            sys.exit(1)
+    print(f"  Using cardback: {cardback_path}")
 
-    cur_width, cur_height = img.size
-    if resize:
-        new_width, new_height = resize
-        scale = min(new_height / cur_height, new_width / cur_width)
-        img = img.resize(
-            (int(cur_width * scale), int(cur_height * scale)), Image.Resampling.LANCZOS
-        )
-    bio = io.BytesIO()
-    img.save(bio, format="PNG")
-    del img
-    return bio.getvalue()
+    # 3. Download images
+    print("Downloading images...")
+    id_to_cached = download_all(fronts, backs)
 
+    # 4. Crop / process
+    id_to_crop = crop_all(id_to_cached, args.dpi, args.vibrance)
 
-def cache_previews(file, folder, data={}):
-    for f in os.listdir(folder):
-        if f in data.keys(): continue
-        fn = os.path.join(folder, f)
-        with Image.open(fn) as im:
-            w, h = im.size
-            r = 248 / w
-        data[f] = (
-            str(to_bytes(fn, (round(w * r), round(h * r))))
-            if f not in data
-            else data[f]
-        )
-    with open(file, "w") as fp:
-        json.dump(data, fp, ensure_ascii=False)
-    return data
+    # 5. Build slot list
+    slot_list = build_slot_list(fronts, backs, cardback_path, id_to_crop)
+    print(f"Total slots: {len(slot_list)}")
 
+    # 6. Generate PDFs
+    page_size = PAGE_SIZES[args.paper]
+    ps = (page_size[1], page_size[0]) if args.orientation == "landscape" else page_size
+    cols = int(ps[0] // CARD_W)
+    rows = int(ps[1] // CARD_H)
+    cards_per_page = cols * rows
+    remainder = len(slot_list) % cards_per_page
+    if remainder != 0:
+        empty = cards_per_page - remainder
+        print(f"Warning: {len(slot_list)} cards don't fill the last page "
+              f"({empty} empty slot{'s' if empty != 1 else ''} on a {cards_per_page}-card page).")
 
-def img_frames_refresh(max_cols):
-    frame_list = []
-    for cardname, number in print_dict["cards"].items():
-        if not os.path.exists(os.path.join(crop_dir, cardname)):
-            print(f"{cardname} not found.")
-            continue
-        idata = eval(
-            img_dict[cardname]
-            if cardname in img_dict
-            else to_bytes(os.path.join(crop_dir, cardname))
-        )
-        img_layout = [
-            sg.Push(),
-            sg.Image(
-                data=idata,
-                key=f"CRD:{cardname}",
-                enable_events=True,
-            ),
-            sg.Push(),
-        ]
-        button_layout = [
-            sg.Push(),
-            sg.Button(
-                "-",
-                key=f"SUB:{cardname}",
-                target=f"NUM:{cardname}",
-                size=(5, 1),
-                enable_events=True,
-            ),
-            sg.Input(number, key=f"NUM:{cardname}", size=(5, 1)),
-            sg.Button(
-                "+",
-                key=f"ADD:{cardname}",
-                target=f"NUM:{cardname}",
-                size=(5, 1),
-                enable_events=True,
-            ),
-            sg.Push(),
-        ]
-        frame_layout = [[sg.Sizer(v_pixels=5)], img_layout, button_layout]
-        title = cardname if len(cardname) < 35 else cardname[:28]+"..."+cardname[cardname.rfind(".")-1:]
-        frame_list += [
-            sg.Frame(
-                title=f" {title} ",
-                layout=frame_layout,
-                title_location=sg.TITLE_LOCATION_BOTTOM,
-                vertical_alignment="center",
-            )
-        ]
-    new_frames = [
-        frame_list[i : i + max_cols] for i in range(0, len(frame_list), max_cols)
-    ]
-    if len(new_frames)==0:
-        return sg.Push()
-    return sg.Column(
-        layout=new_frames, scrollable=True, vertical_scroll_only=True, expand_y=True
-    )
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(args.output, timestamp)
+    os.makedirs(out_dir, exist_ok=True)
+
+    fronts_pdf = os.path.join(out_dir, "fronts.pdf")
+    print(f"Generating {fronts_pdf}...")
+    generate_pdf(fronts_pdf, slot_list, page_size, args.orientation, side="fronts")
+
+    backs_pdf = os.path.join(out_dir, "backs.pdf")
+    print(f"Generating {backs_pdf}...")
+    generate_pdf(backs_pdf, slot_list, page_size, args.orientation, side="backs")
+
+    print(f"Done! PDFs saved to {out_dir}/")
 
 
-def clear_project():
-    global img_dict
-    if os.path.exists(print_json):
-        os.remove(print_json)
-    if os.path.exists(img_cache):
-        os.remove(img_cache)
-    if os.path.exists(image_dir):
-        shutil.rmtree(image_dir)
-    os.makedirs(crop_dir)
-    img_dict = {}
-    print_dict["cards"] = {}
-
-
-def window_setup(cols):
-    column_layout = [
-        [
-            sg.Button(button_text=" Config ", size=(10, 1), key="CONFIG"),
-            sg.Text("Paper Size:"),
-            *[
-                sg.Radio(
-                    size,
-                    "PAPER",
-                    default=bool(print_dict["pagesize"] == size),
-                    key=f"PAPER:{size}",
-                    enable_events=True,
-                )
-                for size in print_dict["page_sizes"]
-            ],
-            sg.VerticalSeparator(),
-            sg.Text("Orientation:"),
-            sg.Radio(
-                "Portrait",
-                "ORI",
-                default=bool(print_dict["orient"] == "Portrait"),
-                key="ORIENT:Portrait",
-                enable_events=True,
-            ),
-            sg.Radio(
-                "Landscape",
-                "ORI",
-                default=bool(print_dict["orient"] == "Landscape"),
-                key="ORIENT:Landscape",
-                enable_events=True,
-            ),
-            sg.VerticalSeparator(),
-            sg.Text("PDF Filename:"),
-            sg.Input(
-                print_dict["filename"], size=(20, 1), key="FILENAME", enable_events=True
-            ),
-            sg.Push(),
-            sg.Button(button_text=" Run Cropper ", size=(10, 1), key="CROP"),
-            sg.Button(button_text=" Save Project ", size=(10, 1), key="SAVE"),
-            sg.Button(button_text=" Render PDF ", size=(10, 1), key="RENDER"),
-            sg.Button(button_text=" Reset ", size=(10, 1), key="RESET"),
-        ],
-        [
-            sg.Frame(
-                title="Card Images", layout=[[img_frames_refresh(cols)]], expand_y=True
-            )
-        ],
-    ]
-    layout = [
-        [
-            sg.Push(),
-            sg.Column(layout=column_layout, expand_y=True),
-            sg.Push(),
-        ],
-    ]
-    window = sg.Window(
-        "PDF Proxy Printer",
-        layout,
-        resizable=True,
-        finalize=True,
-        element_justification="center",
-        enable_close_attempted_event=True,
-        size=print_dict["size"],
-    )
-    window.bind("<Configure>", "Event")
-    return window
-
-crop_list = os.listdir(crop_dir)
-img_dict = {}
-if os.path.exists(img_cache):
-    with open(img_cache, "r") as fp:
-        img_dict = json.load(fp)
-if len(img_dict.keys()) < len(crop_list):
-    img_dict = cache_previews(img_cache, crop_dir, img_dict)
-img_dict = cropper(image_dir, img_dict)
-
-if os.path.exists(print_json):
-    with open(print_json, "r") as fp:
-        print_dict = json.load(fp)
-    # Check that we have all our cards accounted for
-    if len(print_dict["cards"].items()) < len(os.listdir(crop_dir)):
-        for img in os.listdir(crop_dir):
-            if img not in print_dict["cards"].keys():
-                print_dict["cards"][img] = 1
-else:
-    # Initialize our values
-    print_dict = {
-        "cards": {},
-        # program window settings
-        "size": (1480, 920),
-        "columns": 5,
-        # pdf generation options
-        "pagesize": "Letter",
-        "page_sizes": ["Letter", "A4", "Legal"],
-        "orient": "Portrait",
-        "filename": "_printme",
-    }
-    for img in os.listdir(crop_dir):
-        print_dict["cards"][img] = 1
-
-window = window_setup(print_dict["columns"])
-old_size = window.size
-for k in window.key_dict.keys():
-    if "CRD:" in str(k):
-        window[k].bind("<Button-1>", "-LEFT")
-        window[k].bind("<Button-3>", "-RIGHT")
-loading_window.close()
-while True:
-    event, values = window.read()
-
-    if event == sg.WIN_CLOSED or event == sg.WINDOW_CLOSE_ATTEMPTED_EVENT:
-        break
-
-    if "ADD:" in event or "SUB:" in event or "CRD:" in event:
-        name = event[4:]
-        if "-RIGHT" in name:
-            name = name.replace("-RIGHT", "")
-            e = "SUB:"
-        elif "-LEFT" in name:
-            name = name.replace("-LEFT", "")
-            e = "ADD:"
-        else:
-            e = event[:4]
-        key = "NUM:" + name
-        num = int(values[key])
-        num += 1 if "ADD" in e else 0 if num <= 0 else -1
-        print_dict["cards"][name] = num
-        window[key].update(str(num))
-
-    if "ORIENT:" in event:
-        print_dict["orient"] = event.replace("ORIENT:", "")
-
-    if "PAPER:" in event:
-        print_dict["pagesize"] = event.replace("PAPER:", "")
-
-    if "FILENAME" in event:
-        print_dict["filename"] = window["FILENAME"].get()
-
-    if "CONFIG" in event:
-        subprocess.Popen(["config.ini"], shell=True)
-
-    if "SAVE" in event:
-        with open(print_json, "w") as fp:
-            json.dump(print_dict, fp)
-
-    if event in ["CROP", "RENDER"]:
-        config.read(os.path.join(cwd, "config.ini"))
-        cfg = config["DEFAULT"]
-
-    if "CROP" in event:
-        oldwindow = window
-        grey_window = grey_out(window)
-
-        img_dict = cropper(image_dir, img_dict)
-        for img in os.listdir(crop_dir):
-            if img not in print_dict["cards"].keys():
-                print(f"{img} found and added to list.")
-                print_dict["cards"][img] = 1
-                
-        window = window_setup(print_dict["columns"])
-        window.bring_to_front()
-        oldwindow.close()
-        grey_window.close()
-        window.refresh()
-        for k in window.key_dict.keys():
-            if "CRD:" in str(k):
-                window[k].bind("<Button-1>", "-LEFT")
-                window[k].bind("<Button-3>", "-RIGHT")
-
-    if "RENDER" in event:
-        grey_window = grey_out(window)
-        render_window = popup("Rendering...")
-        render_window.refresh()
-        lookup = {"Letter": letter, "A4": A4, "Legal": legal}
-        pdf_gen(print_dict, lookup[print_dict["pagesize"]])
-        render_window.close()
-        clear_project()
-        grey_window.close()
-        window.bring_to_front()
-        window.refresh()
-
-    if "RESET" in event:
-        if sg.popup_yes_no("Clear all images and project data?", title="Reset") == "Yes":
-            clear_project()
-            oldwindow = window
-            window = window_setup(print_dict["columns"])
-            window.bring_to_front()
-            oldwindow.close()
-            window.refresh()
-            for k in window.key_dict.keys():
-                if "CRD:" in str(k):
-                    window[k].bind("<Button-1>", "-LEFT")
-                    window[k].bind("<Button-3>", "-RIGHT")
-
-    if event and print_dict["size"] != window.size:
-        print_dict["size"] = window.size
-
-with open(print_json, "w") as fp:
-    json.dump(print_dict, fp)
-window.close()
+if __name__ == "__main__":
+    main()

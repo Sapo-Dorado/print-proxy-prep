@@ -151,13 +151,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# no images!
-*.pdf
-*.png
-*.gif
-*.jpg
-*.jpeg
+# project data
+images/
+output/
 
-# local project files
-img.cache
-print.json
+# allow the default cardback to be committed
+!cardback.jpg
