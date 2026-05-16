@@ -1,32 +1,90 @@
 # print-proxy-prep
-Crop bleed edges from proxy images and make PDFs for at-home printing.
 
-![image](https://user-images.githubusercontent.com/103437609/203212263-1a029874-3611-4daf-8ac5-e1d23b429db6.png)
+CLI tool that downloads card images from Google Drive, crops bleed edges, and generates front/back PDFs for double-sided printing.
 
-# Installation
-You're gonna need <a href="https://www.python.org/downloads/">Python</a>, I'd say whatever the latest version is, should work.
-When installing, make sure to add Python to PATH.
-![image](https://user-images.githubusercontent.com/103437609/203196002-f04b0c0d-cb2e-4154-ba90-f2f9578ced95.png)
+## Usage
 
-With Python installed, go ahead and download the zip and unzip it wherever you like.
-![image](https://user-images.githubusercontent.com/103437609/203219985-019cea6e-2a85-4ea8-ba90-b96e7665eae7.png)
+Provide an XML order file describing which card images to include:
 
-I made a couple batch scripts to help with installation if you're not savvy with Python, go ahead and run 1_SETUP.bat and it should make a folder called "images" and one called "venv". Then, it will use pip to install the dependancies from "requirements.txt" into that virtual environment.
+```bash
+print-proxy-prep order.xml
+```
 
-Then, you can run main.py from the command line like "venv\scripts\python main.py", or I have "2_RUN.bat" that you can just click and it will pop up the GUI.
+### Options
 
-# Running the Program
-![image](https://user-images.githubusercontent.com/103437609/203212112-50db47df-0a4e-4bf2-9c59-a8554f521b7c.png)
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-o, --output DIR` | `./output` | Base output directory |
+| `--paper {letter,a4,legal}` | `letter` | Page size |
+| `--orientation {portrait,landscape}` | `portrait` | Page orientation |
+| `--dpi N` | `1200` | Max DPI before downscaling |
+| `--vibrance` | off | Apply vibrance LUT |
+| `--cardback PATH` | bundled `cardback.jpg` | Custom cardback image |
+| `--cache-dir DIR` | `images/` next to script | Where to store downloaded/cropped images |
+| `--clear-cache` | — | Delete cached images and exit |
 
-First, throw some images in the \images\ folder. Then, when you opem main.py or hit the "Run Cropper" button from the GUI, it will go through all the images and calculate and crop them.
+### XML format
 
-You can either use the +/- buttons, left or right click the images themselves, or input whatever number you want (good for basic lands for example). I've included sizing for Letter (8.5" x 11"), A4 (8.27" x 11.69"), and Legal (8 1/2" x 14"), but other options would be easy to add if it's requested. Last, you can name your pdf. You don't need to add a ".pdf", I've got that covered for you.
+```xml
+<order>
+  <fronts>
+    <card>
+      <id>GOOGLE_DRIVE_FILE_ID</id>
+      <slots>1,2,3</slots>
+      <name>card_name.jpg</name>
+    </card>
+  </fronts>
+  <backs>
+    <card>
+      <id>GOOGLE_DRIVE_FILE_ID</id>
+      <slots>1,2,3</slots>
+      <name>back_name.jpg</name>
+    </card>
+  </backs>
+</order>
+```
 
-When you're done getting your print order setup, hit "Render PDF" and it will make your PDF and open it up for you. Hopefully you can handle yourself from there.
+Each `<card>` entry specifies a Google Drive file ID, which slots it fills, and the filename (used for the file extension). Cards in `<backs>` override the default cardback for their slots.
 
-# SOME NOTES:
-- The program will automatically save if you close the window. It will not save if you close the console window or if it crashes! The data is stored in print.json.
-- image.cache if a file that is made that stores the data for the thumbnails.
-- Both of these should be deleted if they get out of sync with your images\crops folder, so they can be repopulated. When in doubt, close the program and open it again!
+## Nix
 
-I'll be working on streamlining stuff, feel free to make suggestions.
+### Run directly
+
+```bash
+nix run github:your-user/print-proxy-prep -- order.xml
+```
+
+### Dev shell
+
+```bash
+nix develop
+python main.py order.xml
+```
+
+### Use from another flake
+
+The flake exports `lib.mkPrintProxyPrep` so a consuming service can bake in custom cache and output paths:
+
+```nix
+{
+  inputs.print-proxy-prep.url = "github:your-user/print-proxy-prep";
+
+  outputs = { self, nixpkgs, print-proxy-prep, ... }: {
+    packages.x86_64-linux.default = print-proxy-prep.lib.mkPrintProxyPrep {
+      pkgs = import nixpkgs { system = "x86_64-linux"; };
+      cacheDir = "/var/lib/print-proxy-prep/cache";
+      outputDir = "/var/lib/print-proxy-prep/output";
+    };
+  };
+}
+```
+
+An overlay is also available:
+
+```nix
+{
+  nixpkgs.overlays = [ print-proxy-prep.overlays.default ];
+}
+```
+
+This adds `pkgs.print-proxy-prep` with default paths (controllable at runtime via CLI flags).

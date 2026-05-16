@@ -15,12 +15,9 @@ from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
 # ---------------------------------------------------------------------------
-# Paths relative to this script
+# Paths – defaults are relative to this script, overridable via CLI / env
 # ---------------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-IMAGE_DIR = os.path.join(SCRIPT_DIR, "images")
-CACHE_DIR = os.path.join(IMAGE_DIR, "cache")
-CROP_DIR = os.path.join(IMAGE_DIR, "crop")
 VIBRANCE_CUBE = os.path.join(SCRIPT_DIR, "vibrance.CUBE")
 
 PAGE_SIZES = {
@@ -80,6 +77,11 @@ def build_parser():
         help="Path to a custom cardback image (overrides the default)",
     )
     parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Directory for cached/cropped images (default: images/ next to script)",
+    )
+    parser.add_argument(
         "--clear-cache",
         action="store_true",
         help="Delete cached images. If no xml_file given, just clear and exit.",
@@ -126,13 +128,13 @@ def extension_from_name(name):
     return ext  # includes the dot
 
 
-def download_image(drive_id, name):
-    """Download a Google Drive file into CACHE_DIR if not already cached.
+def download_image(drive_id, name, cache_dir):
+    """Download a Google Drive file into cache_dir if not already cached.
 
     Returns the cached file path, or None if download failed.
     """
     ext = extension_from_name(name)
-    cached_path = os.path.join(CACHE_DIR, drive_id + ext)
+    cached_path = os.path.join(cache_dir, drive_id + ext)
     if os.path.exists(cached_path):
         return cached_path
 
@@ -151,12 +153,12 @@ def download_image(drive_id, name):
     return cached_path
 
 
-def download_all(fronts, backs):
+def download_all(fronts, backs, cache_dir):
     """Download every unique image referenced in the order.
 
     Returns a dict mapping drive_id -> cached_file_path.
     """
-    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
 
     # Collect unique (id, name) pairs – need name for extension
     unique = {}
@@ -169,13 +171,13 @@ def download_all(fronts, backs):
     failed = []
     items = list(unique.items())
     need_download = [(did, n) for did, n in items
-                     if not os.path.exists(os.path.join(CACHE_DIR, did + extension_from_name(n)))]
+                     if not os.path.exists(os.path.join(cache_dir, did + extension_from_name(n)))]
     cached_count = len(items) - len(need_download)
     if cached_count > 0:
         print(f"  {cached_count} image(s) already cached, {len(need_download)} to download")
 
     for i, (drive_id, name) in enumerate(items):
-        path = download_image(drive_id, name)
+        path = download_image(drive_id, name, cache_dir)
         if path is not None:
             id_to_path[drive_id] = path
         else:
@@ -192,7 +194,7 @@ def download_all(fronts, backs):
         time.sleep(10)
         still_failed = []
         for i, (drive_id, name) in enumerate(failed):
-            path = download_image(drive_id, name)
+            path = download_image(drive_id, name, cache_dir)
             if path is not None:
                 id_to_path[drive_id] = path
             else:
@@ -221,8 +223,8 @@ def load_vibrance_lut():
     return ImageFilter.Color3DLUT(lsize, lut_table)
 
 
-def crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut):
-    """Crop, downscale, apply LUT, and save into CROP_DIR.
+def crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut, crop_dir):
+    """Crop, downscale, apply LUT, and save into crop_dir.
 
     Returns the crop file path.
     """
@@ -232,7 +234,7 @@ def crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut):
             fmt = probe.format or "PNG"
         ext = f".{fmt.lower()}"
 
-    crop_path = os.path.join(CROP_DIR, drive_id + ext)
+    crop_path = os.path.join(crop_dir, drive_id + ext)
     if os.path.exists(crop_path):
         return crop_path
 
@@ -260,9 +262,9 @@ def crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut):
     return crop_path
 
 
-def crop_all(id_to_cached, max_dpi, vibrance):
+def crop_all(id_to_cached, max_dpi, vibrance, crop_dir):
     """Process every cached image. Returns dict drive_id -> crop_path."""
-    os.makedirs(CROP_DIR, exist_ok=True)
+    os.makedirs(crop_dir, exist_ok=True)
 
     vibrance_lut = load_vibrance_lut() if vibrance else None
 
@@ -270,7 +272,7 @@ def crop_all(id_to_cached, max_dpi, vibrance):
     id_to_crop = {}
     for drive_id, cached_path in id_to_cached.items():
         ext = os.path.splitext(cached_path)[1]
-        id_to_crop[drive_id] = crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut)
+        id_to_crop[drive_id] = crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut, crop_dir)
 
     return id_to_crop
 
@@ -375,14 +377,14 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts"):
 # ---------------------------------------------------------------------------
 # Clear cache
 # ---------------------------------------------------------------------------
-def clear_cache():
+def clear_cache(cache_dir, crop_dir):
     """Remove cached and cropped images."""
-    for d in [CACHE_DIR, CROP_DIR]:
+    for d in [cache_dir, crop_dir]:
         if os.path.exists(d):
             shutil.rmtree(d)
             print(f"Cleared {d}")
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    os.makedirs(CROP_DIR, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(crop_dir, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +394,11 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    # Resolve cache directories
+    image_dir = os.path.join(args.cache_dir, "images") if args.cache_dir else os.path.join(SCRIPT_DIR, "images")
+    cache_dir = os.path.join(image_dir, "cache")
+    crop_dir = os.path.join(image_dir, "crop")
+
     # Validate: need at least one of xml_file or --clear-cache
     if not args.xml_file and not args.clear_cache:
         parser.print_usage()
@@ -399,7 +406,7 @@ def main():
 
     # Handle --clear-cache
     if args.clear_cache:
-        clear_cache()
+        clear_cache(cache_dir, crop_dir)
         if not args.xml_file:
             print("Cache cleared. No XML file provided; exiting.")
             return
@@ -430,16 +437,16 @@ def main():
 
     # 3. Download images
     print("Downloading images...")
-    id_to_cached = download_all(fronts, backs)
+    id_to_cached = download_all(fronts, backs, cache_dir)
 
     # 4. Crop / process
-    id_to_crop = crop_all(id_to_cached, args.dpi, args.vibrance)
+    id_to_crop = crop_all(id_to_cached, args.dpi, args.vibrance, crop_dir)
 
     # 4b. Crop cardback through same pipeline
-    os.makedirs(CROP_DIR, exist_ok=True)
+    os.makedirs(crop_dir, exist_ok=True)
     vibrance_lut = load_vibrance_lut() if args.vibrance else None
     ext = os.path.splitext(cardback_path)[1]
-    cropped_cardback = crop_image(cardback_path, "cardback", ext, args.dpi, vibrance_lut)
+    cropped_cardback = crop_image(cardback_path, "cardback", ext, args.dpi, vibrance_lut, crop_dir)
 
     # 5. Build slot list
     slot_list = build_slot_list(fronts, backs, cropped_cardback, id_to_crop)
