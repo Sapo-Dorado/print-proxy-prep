@@ -75,13 +75,6 @@
     flake-utils.lib.eachSystem supportedSystems (system:
       let
         pkgs = import nixpkgs { inherit system; };
-        python = pkgs.python3;
-
-        pythonEnv = python.withPackages (ps: [
-          ps.pillow
-          ps.reportlab
-          ps.requests
-        ]);
       in
       {
         packages.default = mkPrintProxyPrep { inherit pkgs; };
@@ -92,7 +85,7 @@
         };
 
         devShells.default = pkgs.mkShell {
-          buildInputs = [ pythonEnv ];
+          buildInputs = [ self.packages.${system}.default ];
         };
       }
     );
