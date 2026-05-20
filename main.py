@@ -395,7 +395,7 @@ def main():
     args = parser.parse_args()
 
     # Resolve cache directories
-    image_dir = os.path.join(args.cache_dir, "images") if args.cache_dir else os.path.join(SCRIPT_DIR, "images")
+    image_dir = os.path.join(args.cache_dir, "images") if args.cache_dir else os.path.join(os.getcwd(), "images")
     cache_dir = os.path.join(image_dir, "cache")
     crop_dir = os.path.join(image_dir, "crop")
 
