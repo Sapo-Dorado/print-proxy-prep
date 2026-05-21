@@ -82,6 +82,11 @@ def build_parser():
         help="Directory for cached/cropped images (default: images/ next to script)",
     )
     parser.add_argument(
+        "--no-back",
+        action="store_true",
+        help="Leave card backs blank unless a card has a specific back image.",
+    )
+    parser.add_argument(
         "--clear-cache",
         action="store_true",
         help="Delete cached images. If no xml_file given, just clear and exit.",
@@ -357,13 +362,14 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts"):
         if j == 0 and i > 0:
             pages.showPage()
 
-        pages.drawImage(
-            img_path,
-            col * CARD_W + rx,
-            row * CARD_H + ry,
-            CARD_W,
-            CARD_H,
-        )
+        if img_path is not None:
+            pages.drawImage(
+                img_path,
+                col * CARD_W + rx,
+                row * CARD_H + ry,
+                CARD_W,
+                CARD_H,
+            )
 
         # Draw crop marks on last card of a page or last card overall
         if j == cards_per_page - 1 or i == total - 1:
@@ -423,17 +429,21 @@ def main():
     print(f"  {len(fronts)} front card entries, {len(backs)} back card entries")
 
     # 2. Resolve cardback image
-    if args.cardback:
+    if args.no_back:
+        cardback_path = None
+        print("  Cardback: blank (--no-back)")
+    elif args.cardback:
         cardback_path = os.path.abspath(args.cardback)
         if not os.path.isfile(cardback_path):
             print(f"Error: cardback image not found: {cardback_path}", file=sys.stderr)
             sys.exit(1)
+        print(f"  Using cardback: {cardback_path}")
     else:
         cardback_path = os.path.join(SCRIPT_DIR, "cardback.jpg")
         if not os.path.isfile(cardback_path):
             print("Error: default cardback.jpg not found in project directory.", file=sys.stderr)
             sys.exit(1)
-    print(f"  Using cardback: {cardback_path}")
+        print(f"  Using cardback: {cardback_path}")
 
     # 3. Download images
     print("Downloading images...")
@@ -445,8 +455,11 @@ def main():
     # 4b. Crop cardback through same pipeline
     os.makedirs(crop_dir, exist_ok=True)
     vibrance_lut = load_vibrance_lut() if args.vibrance else None
-    ext = os.path.splitext(cardback_path)[1]
-    cropped_cardback = crop_image(cardback_path, "cardback", ext, args.dpi, vibrance_lut, crop_dir)
+    if cardback_path is not None:
+        ext = os.path.splitext(cardback_path)[1]
+        cropped_cardback = crop_image(cardback_path, "cardback", ext, args.dpi, vibrance_lut, crop_dir)
+    else:
+        cropped_cardback = None
 
     # 5. Build slot list
     slot_list = build_slot_list(fronts, backs, cropped_cardback, id_to_crop)
