@@ -380,15 +380,20 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts",
     pw, ph = page_size
     cols = int(pw // CARD_W)
     rows = int(ph // CARD_H)
-    slot_w = CARD_W + 2 * bleed_pts
-    slot_h = CARD_H + 2 * bleed_pts
 
     if bleed_pts > 0:
+        # Cap slot dimensions to what fits evenly on the page so the grid never
+        # overflows. On letter portrait this trims the outer top/bottom bleed by
+        # ~1 mm while keeping the full inner bleed gutters between cards.
+        slot_w = min(CARD_W + 2 * bleed_pts, pw / cols)
+        slot_h = min(CARD_H + 2 * bleed_pts, ph / rows)
         rx = (pw - slot_w * cols) / 2
         ry = (ph - slot_h * rows) / 2
     else:
-        rx = round((pw - CARD_W * cols) / 2)
-        ry = round((ph - CARD_H * rows) / 2)
+        slot_w = CARD_W
+        slot_h = CARD_H
+        rx = round((pw - slot_w * cols) / 2)
+        ry = round((ph - slot_h * rows) / 2)
 
     cards_per_page = cols * rows
     pages = canvas.Canvas(pdf_path, pagesize=page_size)
