@@ -368,20 +368,26 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts",
 
     side: 'fronts' or 'backs'
     bleed_pts: bleed in points (0 = crop mode, BLEED_PTS = bleed mode).
-               When non-zero, slots are sized CARD_W+2*bleed_pts × CARD_H+2*bleed_pts
-               and crop marks are placed at the actual card cut lines (inset from slot edges).
+               The card grid is always based on the final cut size (CARD_W × CARD_H),
+               so card count per page is the same in both modes. In bleed mode, images
+               are drawn larger (CARD_W+2*bleed_pts × CARD_H+2*bleed_pts) and shifted
+               so the bleed extends into adjacent gutters and page margins. Crop marks
+               remain at the cut-line grid, same positions as crop mode.
     """
     if orientation == "landscape":
         page_size = (page_size[1], page_size[0])
 
     pw, ph = page_size
-    slot_w = CARD_W + 2 * bleed_pts
-    slot_h = CARD_H + 2 * bleed_pts
-    cols = int(pw // slot_w)
-    rows = int(ph // slot_h)
-    rx = round((pw - slot_w * cols) / 2)
-    ry = round((ph - slot_h * rows) / 2)
+    # Grid is always based on cut size — same card count regardless of bleed mode
+    cols = int(pw // CARD_W)
+    rows = int(ph // CARD_H)
+    rx = round((pw - CARD_W * cols) / 2)
+    ry = round((ph - CARD_H * rows) / 2)
     cards_per_page = cols * rows
+
+    # In bleed mode, images include the bleed border on all sides
+    img_w = CARD_W + 2 * bleed_pts
+    img_h = CARD_H + 2 * bleed_pts
 
     pages = canvas.Canvas(pdf_path, pagesize=page_size)
 
@@ -398,27 +404,21 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts",
             pages.showPage()
 
         if img_path is not None:
+            # Shift by -bleed_pts so the card content lands on the cut-line grid;
+            # the bleed zone extends into the adjacent gutter / page margin.
             pages.drawImage(
                 img_path,
-                col * slot_w + rx,
-                row * slot_h + ry,
-                slot_w,
-                slot_h,
+                col * CARD_W + rx - bleed_pts,
+                row * CARD_H + ry - bleed_pts,
+                img_w,
+                img_h,
             )
 
-        # Draw crop marks on last card of a page or last card overall.
-        # In bleed mode, marks go at the actual card cut lines (inset by bleed_pts
-        # from each slot edge), not at slot corners.
+        # Crop marks at cut-line intersections — identical positions in both modes
         if j == cards_per_page - 1 or i == total - 1:
-            # Collect the unique x/y positions of every card cut-line intersection.
-            # For bleed_pts=0 this reduces to the same (cols+1)×(rows+1) grid as before.
-            mark_xs = sorted({rx + cc * slot_w + bleed_pts + dx
-                               for cc in range(cols) for dx in (0.0, CARD_W)})
-            mark_ys = sorted({ry + cr * slot_h + bleed_pts + dy
-                               for cr in range(rows) for dy in (0.0, CARD_H)})
-            for my in mark_ys:
-                for mx in mark_xs:
-                    draw_cross(pages, mx, my)
+            for cy in range(rows + 1):
+                for cx in range(cols + 1):
+                    draw_cross(pages, rx + CARD_W * cx, ry + CARD_H * cy)
 
     pages.save()
 
@@ -519,13 +519,11 @@ def main():
 
     # 6. Generate PDFs
     bleed_pts = BLEED_PTS if args.bleed else 0.0
-    slot_w = CARD_W + 2 * bleed_pts
-    slot_h = CARD_H + 2 * bleed_pts
 
     page_size = PAGE_SIZES[args.paper]
     ps = (page_size[1], page_size[0]) if args.orientation == "landscape" else page_size
-    cols = int(ps[0] // slot_w)
-    rows = int(ps[1] // slot_h)
+    cols = int(ps[0] // CARD_W)
+    rows = int(ps[1] // CARD_H)
     cards_per_page = cols * rows
     remainder = len(slot_list) % cards_per_page
     if remainder != 0:
@@ -534,8 +532,9 @@ def main():
               f"({empty} empty slot{'s' if empty != 1 else ''} on a {cards_per_page}-card page).")
 
     if args.bleed:
-        print(f"Bleed mode: slots {slot_w/72:.2f}\"×{slot_h/72:.2f}\" "
-              f"({cols}×{rows}={cards_per_page} cards/page)")
+        print(f"Bleed mode: {cols}×{rows}={cards_per_page} cards/page, "
+              f"images {(CARD_W + 2*bleed_pts)/72:.2f}\"×{(CARD_H + 2*bleed_pts)/72:.2f}\" "
+              f"(bleed extends into gutters)")
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(args.output, timestamp)
