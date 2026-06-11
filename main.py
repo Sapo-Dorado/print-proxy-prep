@@ -267,10 +267,10 @@ def crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut, crop_dir,
         dpi = c * (1 / 0.12)
 
         if keep_bleed:
-            print(f"  Keeping bleed {os.path.basename(cached_path)} – DPI: {dpi:.0f}, bleed: {c}px")
+            print(f"  {os.path.basename(cached_path)}")
             out_im = im.copy()
         else:
-            print(f"  Cropping {os.path.basename(cached_path)} – DPI: {dpi:.0f}, bleed: {c}px")
+            print(f"  {os.path.basename(cached_path)}")
             out_im = im.crop((c, c, w - c, h - c))
 
         if dpi > max_dpi:
@@ -366,39 +366,24 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts",
                  *, bleed_pts=0.0):
     """Generate a PDF of card images laid out on pages.
 
-    side: 'fronts' or 'backs'
-    bleed_pts: bleed in points (0 = crop mode, BLEED_PTS = bleed mode).
+    Each slot is (CARD_W + 2*bleed_pts) x (CARD_H + 2*bleed_pts). Grid count
+    is based on CARD_W/CARD_H so bleed mode fits the same cards per page as
+    crop mode.
 
-    Layout
-    ------
-    Each slot is (CARD_W + 2*bleed_pts) × (CARD_H + 2*bleed_pts). The number
-    of columns and rows is determined by CARD_W/CARD_H so bleed mode fits the
-    same card count as crop mode. On letter portrait the outer bleed clips
-    ~1 mm at the top/bottom page edge — fine, it's cut away anyway.
-
-    Crop marks
-    ----------
-    Every card has a cut rectangle inset by bleed_pts from its slot on all
-    sides. We collect every unique x and y cut-line position across all cards
-    in the grid and draw a mark at each (x, y) intersection. This means each
-    inner gutter gets TWO marks (one per adjacent card's cut line) so the bleed
-    zone between them is clearly visible. When bleed_pts=0 the cut rect equals
-    the slot, collapsing each gutter pair to a single point — identical to the
-    original 4×4 crop-mode grid.
+    Crop marks are placed at slot grid intersections — the outer boundary of
+    each card including its bleed. This gives (cols+1)*(rows+1) = 16 marks for
+    a 3x3 grid, useful for cutting rows/columns of cards out of the sheet.
     """
     if orientation == "landscape":
         page_size = (page_size[1], page_size[0])
 
     pw, ph = page_size
-    # Card count always based on cut size, regardless of bleed
     cols = int(pw // CARD_W)
     rows = int(ph // CARD_H)
     slot_w = CARD_W + 2 * bleed_pts
     slot_h = CARD_H + 2 * bleed_pts
 
     if bleed_pts > 0:
-        # Centre the enlarged grid; ry may be slightly negative so the outer
-        # top/bottom bleed clips at the page edge — fine, it's cut away anyway
         rx = (pw - slot_w * cols) / 2
         ry = (ph - slot_h * rows) / 2
     else:
@@ -406,24 +391,6 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts",
         ry = round((ph - CARD_H * rows) / 2)
 
     cards_per_page = cols * rows
-
-    # Pre-compute unique crop-mark x/y positions.
-    # For each card slot, the cut rectangle left/right edges are at
-    #   slot_origin + bleed_pts  and  slot_origin + slot_w - bleed_pts
-    # Collecting all of these (deduplicated) gives us the full set of cut lines.
-    # In crop mode bleed_pts==0 so left==0 and right==slot_w, collapsing each
-    # pair to a single value — yielding the standard (cols+1)×(rows+1) grid.
-    cut_xs = sorted({
-        rx + col * slot_w + offset
-        for col in range(cols)
-        for offset in (bleed_pts, slot_w - bleed_pts)
-    })
-    cut_ys = sorted({
-        ry + row * slot_h + offset
-        for row in range(rows)
-        for offset in (bleed_pts, slot_h - bleed_pts)
-    })
-
     pages = canvas.Canvas(pdf_path, pagesize=page_size)
 
     total = len(slot_list)
@@ -448,9 +415,9 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts",
             )
 
         if j == cards_per_page - 1 or i == total - 1:
-            for my in cut_ys:
-                for mx in cut_xs:
-                    draw_cross(pages, mx, my)
+            for cy in range(rows + 1):
+                for cx in range(cols + 1):
+                    draw_cross(pages, rx + cx * slot_w, ry + cy * slot_h)
 
     pages.save()
 
