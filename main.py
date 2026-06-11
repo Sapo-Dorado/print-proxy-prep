@@ -414,11 +414,24 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts",
                 img_h,
             )
 
-        # Crop marks at cut-line intersections — identical positions in both modes
+        # Crop marks: inner marks at cut lines, outer marks at image edges.
+        # In crop mode bleed_pts=0 so all marks are at image edges = cut lines.
+        # In bleed mode the outer image edges are bleed_pts beyond the cut lines,
+        # so we shift the outermost marks outward to match the image boundary.
         if j == cards_per_page - 1 or i == total - 1:
             for cy in range(rows + 1):
                 for cx in range(cols + 1):
-                    draw_cross(pages, rx + CARD_W * cx, ry + CARD_H * cy)
+                    mark_x = rx + CARD_W * cx
+                    mark_y = ry + CARD_H * cy
+                    if cx == 0:
+                        mark_x -= bleed_pts
+                    elif cx == cols:
+                        mark_x += bleed_pts
+                    if cy == 0:
+                        mark_y -= bleed_pts
+                    elif cy == rows:
+                        mark_y += bleed_pts
+                    draw_cross(pages, mark_x, mark_y)
 
     pages.save()
 
