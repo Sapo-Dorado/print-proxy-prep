@@ -32,6 +32,10 @@ CARD_H = 3.46 * 72  # points
 BLEED_IN  = 0.12          # inches of bleed per side (MPC standard)
 BLEED_PTS = BLEED_IN * 72  # 8.64 points
 
+# Minimum non-printable margin assumed for consumer inkjet printers (~4 mm).
+# Slots are sized so card bodies land inside this margin on all sides.
+PRINTER_MARGIN_PTS = 12.0
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -382,11 +386,12 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts",
     rows = int(ph // CARD_H)
 
     if bleed_pts > 0:
-        # Cap slot dimensions to what fits evenly on the page so the grid never
-        # overflows. On letter portrait this trims the outer top/bottom bleed by
-        # ~1 mm while keeping the full inner bleed gutters between cards.
-        slot_w = min(CARD_W + 2 * bleed_pts, pw / cols)
-        slot_h = min(CARD_H + 2 * bleed_pts, ph / rows)
+        # Size slots to fit within the printer's usable area so card bodies are
+        # never clipped. The grid is centred on the page; ry/rx >= PRINTER_MARGIN_PTS.
+        usable_w = pw - 2 * PRINTER_MARGIN_PTS
+        usable_h = ph - 2 * PRINTER_MARGIN_PTS
+        slot_w = min(CARD_W + 2 * bleed_pts, usable_w / cols)
+        slot_h = min(CARD_H + 2 * bleed_pts, usable_h / rows)
         rx = (pw - slot_w * cols) / 2
         ry = (ph - slot_h * rows) / 2
     else:
