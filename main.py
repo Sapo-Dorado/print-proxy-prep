@@ -368,27 +368,37 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts",
 
     side: 'fronts' or 'backs'
     bleed_pts: bleed in points (0 = crop mode, BLEED_PTS = bleed mode).
-               The card grid is always based on the final cut size (CARD_W × CARD_H),
-               so card count per page is the same in both modes. In bleed mode, images
-               are drawn larger (CARD_W+2*bleed_pts × CARD_H+2*bleed_pts) and shifted
-               so the bleed extends into adjacent gutters and page margins. Crop marks
-               remain at the cut-line grid, same positions as crop mode.
+
+    In bleed mode each slot is (CARD_W+2*bleed) × (CARD_H+2*bleed) so adjacent
+    images share a full bleed gutter with no overlap. Card count per page matches
+    crop mode (grid determined by CARD_W × CARD_H). The outer bleed clips very
+    slightly (~1 mm) at the top/bottom page edge on letter portrait — acceptable
+    since bleed is discarded when cutting.
+
+    Crop marks: outer marks at the outer card cut lines; inner marks at the
+    midpoint of the bleed gutter (= slot boundary). When bleed_pts=0 all marks
+    coincide with image edges, identical to crop mode.
     """
     if orientation == "landscape":
         page_size = (page_size[1], page_size[0])
 
     pw, ph = page_size
-    # Grid is always based on cut size — same card count regardless of bleed mode
+    # Card count is always based on cut size regardless of bleed
     cols = int(pw // CARD_W)
     rows = int(ph // CARD_H)
-    rx = round((pw - CARD_W * cols) / 2)
-    ry = round((ph - CARD_H * rows) / 2)
+    slot_w = CARD_W + 2 * bleed_pts
+    slot_h = CARD_H + 2 * bleed_pts
+
+    if bleed_pts > 0:
+        # Centre the enlarged grid; ry may be slightly negative so the outer
+        # top/bottom bleed clips at the page edge — fine, it's cut away anyway
+        rx = (pw - slot_w * cols) / 2
+        ry = (ph - slot_h * rows) / 2
+    else:
+        rx = round((pw - CARD_W * cols) / 2)
+        ry = round((ph - CARD_H * rows) / 2)
+
     cards_per_page = cols * rows
-
-    # In bleed mode, images include the bleed border on all sides
-    img_w = CARD_W + 2 * bleed_pts
-    img_h = CARD_H + 2 * bleed_pts
-
     pages = canvas.Canvas(pdf_path, pagesize=page_size)
 
     total = len(slot_list)
@@ -404,34 +414,28 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts",
             pages.showPage()
 
         if img_path is not None:
-            # Shift by -bleed_pts so the card content lands on the cut-line grid;
-            # the bleed zone extends into the adjacent gutter / page margin.
             pages.drawImage(
                 img_path,
-                col * CARD_W + rx - bleed_pts,
-                row * CARD_H + ry - bleed_pts,
-                img_w,
-                img_h,
+                col * slot_w + rx,
+                row * slot_h + ry,
+                slot_w,
+                slot_h,
             )
 
-        # Crop marks: inner marks at cut lines, outer marks at image edges.
-        # In crop mode bleed_pts=0 so all marks are at image edges = cut lines.
-        # In bleed mode the outer image edges are bleed_pts beyond the cut lines,
-        # so we shift the outermost marks outward to match the image boundary.
+        # Crop marks: outer marks at the outer card cut lines; inner marks at slot
+        # boundaries (midpoint of the bleed gutter between adjacent cards).
+        # When bleed_pts=0: slot_w==CARD_W, all expressions reduce to rx+cx*CARD_W
+        # and ry+cy*CARD_H — identical to the original crop-mode grid.
         if j == cards_per_page - 1 or i == total - 1:
             for cy in range(rows + 1):
                 for cx in range(cols + 1):
-                    mark_x = rx + CARD_W * cx
-                    mark_y = ry + CARD_H * cy
-                    if cx == 0:
-                        mark_x -= bleed_pts
-                    elif cx == cols:
-                        mark_x += bleed_pts
-                    if cy == 0:
-                        mark_y -= bleed_pts
-                    elif cy == rows:
-                        mark_y += bleed_pts
-                    draw_cross(pages, mark_x, mark_y)
+                    mx = (rx + bleed_pts              if cx == 0
+                          else rx + cols * slot_w - bleed_pts if cx == cols
+                          else rx + cx * slot_w)
+                    my = (ry + bleed_pts              if cy == 0
+                          else ry + rows * slot_h - bleed_pts if cy == rows
+                          else ry + cy * slot_h)
+                    draw_cross(pages, mx, my)
 
     pages.save()
 
@@ -546,8 +550,8 @@ def main():
 
     if args.bleed:
         print(f"Bleed mode: {cols}×{rows}={cards_per_page} cards/page, "
-              f"images {(CARD_W + 2*bleed_pts)/72:.2f}\"×{(CARD_H + 2*bleed_pts)/72:.2f}\" "
-              f"(bleed extends into gutters)")
+              f"slots {(CARD_W + 2*bleed_pts)/72:.2f}\"×{(CARD_H + 2*bleed_pts)/72:.2f}\" "
+              f"(full bleed gutter between adjacent cards)")
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(args.output, timestamp)
