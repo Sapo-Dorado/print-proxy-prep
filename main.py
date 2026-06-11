@@ -29,6 +29,9 @@ PAGE_SIZES = {
 CARD_W = 2.48 * 72  # points
 CARD_H = 3.46 * 72  # points
 
+BLEED_IN  = 0.12          # inches of bleed per side (MPC standard)
+BLEED_PTS = BLEED_IN * 72  # 8.64 points
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -90,6 +93,16 @@ def build_parser():
         "--clear-cache",
         action="store_true",
         help="Delete cached images. If no xml_file given, just clear and exit.",
+    )
+    parser.add_argument(
+        "--bleed",
+        action="store_true",
+        help=(
+            "Keep bleed edges in output instead of cropping them off. "
+            "Cards are laid out at 2.72×3.70 in (MPC bleed size) with crop marks "
+            "at the actual cut lines. Images must already include a bleed border "
+            "(e.g. sourced from MPC Autofill)."
+        ),
     )
     return parser
 
@@ -228,10 +241,14 @@ def load_vibrance_lut():
     return ImageFilter.Color3DLUT(lsize, lut_table)
 
 
-def crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut, crop_dir):
-    """Crop, downscale, apply LUT, and save into crop_dir.
+def crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut, crop_dir,
+               *, keep_bleed=False, bleed_dir=None):
+    """Crop (or preserve) bleed, downscale, apply LUT, and save.
 
-    Returns the crop file path.
+    When keep_bleed=False (default): strips the bleed border, saves into crop_dir.
+    When keep_bleed=True: keeps the full image with bleed intact, saves into bleed_dir.
+
+    Returns the output file path.
     """
     # If no extension, detect format from file header
     if not ext:
@@ -239,45 +256,57 @@ def crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut, crop_dir):
             fmt = probe.format or "PNG"
         ext = f".{fmt.lower()}"
 
-    crop_path = os.path.join(crop_dir, drive_id + ext)
-    if os.path.exists(crop_path):
-        return crop_path
+    out_dir = bleed_dir if keep_bleed else crop_dir
+    out_path = os.path.join(out_dir, drive_id + ext)
+    if os.path.exists(out_path):
+        return out_path
 
     with Image.open(cached_path) as im:
         w, h = im.size
         c = round(0.12 * min(w / 2.72, h / 3.7))
         dpi = c * (1 / 0.12)
-        print(f"  Cropping {os.path.basename(cached_path)} – DPI: {dpi:.0f}, bleed: {c}px")
-        crop_im = im.crop((c, c, w - c, h - c))
+
+        if keep_bleed:
+            print(f"  Keeping bleed {os.path.basename(cached_path)} – DPI: {dpi:.0f}, bleed: {c}px")
+            out_im = im.copy()
+        else:
+            print(f"  Cropping {os.path.basename(cached_path)} – DPI: {dpi:.0f}, bleed: {c}px")
+            out_im = im.crop((c, c, w - c, h - c))
 
         if dpi > max_dpi:
             scale = max_dpi / dpi
-            crop_im = crop_im.resize(
-                (int(round(crop_im.size[0] * scale)),
-                 int(round(crop_im.size[1] * scale))),
+            out_im = out_im.resize(
+                (int(round(out_im.size[0] * scale)),
+                 int(round(out_im.size[1] * scale))),
                 Image.Resampling.BICUBIC,
             )
-            crop_im = crop_im.filter(ImageFilter.UnsharpMask(1, 20, 8))
+            out_im = out_im.filter(ImageFilter.UnsharpMask(1, 20, 8))
 
         if vibrance_lut is not None:
-            crop_im = crop_im.filter(vibrance_lut)
+            out_im = out_im.filter(vibrance_lut)
 
-        crop_im.save(crop_path, quality=98)
+        out_im.save(out_path, quality=98)
 
-    return crop_path
+    return out_path
 
 
-def crop_all(id_to_cached, max_dpi, vibrance, crop_dir):
-    """Process every cached image. Returns dict drive_id -> crop_path."""
+def crop_all(id_to_cached, max_dpi, vibrance, crop_dir,
+             *, keep_bleed=False, bleed_dir=None):
+    """Process every cached image. Returns dict drive_id -> output_path."""
     os.makedirs(crop_dir, exist_ok=True)
+    if keep_bleed and bleed_dir:
+        os.makedirs(bleed_dir, exist_ok=True)
 
     vibrance_lut = load_vibrance_lut() if vibrance else None
 
-    print("Cropping images...")
+    print("Cropping images..." if not keep_bleed else "Processing images (keeping bleed)...")
     id_to_crop = {}
     for drive_id, cached_path in id_to_cached.items():
         ext = os.path.splitext(cached_path)[1]
-        id_to_crop[drive_id] = crop_image(cached_path, drive_id, ext, max_dpi, vibrance_lut, crop_dir)
+        id_to_crop[drive_id] = crop_image(
+            cached_path, drive_id, ext, max_dpi, vibrance_lut, crop_dir,
+            keep_bleed=keep_bleed, bleed_dir=bleed_dir,
+        )
 
     return id_to_crop
 
@@ -333,19 +362,25 @@ def draw_cross(can, x, y, c=6, s=1):
     can.line(x, y - c, x, y + c)
 
 
-def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts"):
+def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts",
+                 *, bleed_pts=0.0):
     """Generate a PDF of card images laid out on pages.
 
     side: 'fronts' or 'backs'
+    bleed_pts: bleed in points (0 = crop mode, BLEED_PTS = bleed mode).
+               When non-zero, slots are sized CARD_W+2*bleed_pts × CARD_H+2*bleed_pts
+               and crop marks are placed at the actual card cut lines (inset from slot edges).
     """
     if orientation == "landscape":
         page_size = (page_size[1], page_size[0])
 
     pw, ph = page_size
-    cols = int(pw // CARD_W)
-    rows = int(ph // CARD_H)
-    rx = round((pw - (CARD_W * cols)) / 2)
-    ry = round((ph - (CARD_H * rows)) / 2)
+    slot_w = CARD_W + 2 * bleed_pts
+    slot_h = CARD_H + 2 * bleed_pts
+    cols = int(pw // slot_w)
+    rows = int(ph // slot_h)
+    rx = round((pw - slot_w * cols) / 2)
+    ry = round((ph - slot_h * rows) / 2)
     cards_per_page = cols * rows
 
     pages = canvas.Canvas(pdf_path, pagesize=page_size)
@@ -365,17 +400,25 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts"):
         if img_path is not None:
             pages.drawImage(
                 img_path,
-                col * CARD_W + rx,
-                row * CARD_H + ry,
-                CARD_W,
-                CARD_H,
+                col * slot_w + rx,
+                row * slot_h + ry,
+                slot_w,
+                slot_h,
             )
 
-        # Draw crop marks on last card of a page or last card overall
+        # Draw crop marks on last card of a page or last card overall.
+        # In bleed mode, marks go at the actual card cut lines (inset by bleed_pts
+        # from each slot edge), not at slot corners.
         if j == cards_per_page - 1 or i == total - 1:
-            for cy in range(rows + 1):
-                for cx in range(cols + 1):
-                    draw_cross(pages, rx + CARD_W * cx, ry + CARD_H * cy)
+            # Collect the unique x/y positions of every card cut-line intersection.
+            # For bleed_pts=0 this reduces to the same (cols+1)×(rows+1) grid as before.
+            mark_xs = sorted({rx + cc * slot_w + bleed_pts + dx
+                               for cc in range(cols) for dx in (0.0, CARD_W)})
+            mark_ys = sorted({ry + cr * slot_h + bleed_pts + dy
+                               for cr in range(rows) for dy in (0.0, CARD_H)})
+            for my in mark_ys:
+                for mx in mark_xs:
+                    draw_cross(pages, mx, my)
 
     pages.save()
 
@@ -383,9 +426,9 @@ def generate_pdf(pdf_path, slot_list, page_size, orientation, side="fronts"):
 # ---------------------------------------------------------------------------
 # Clear cache
 # ---------------------------------------------------------------------------
-def clear_cache(cache_dir, crop_dir):
-    """Remove cached and cropped images."""
-    for d in [cache_dir, crop_dir]:
+def clear_cache(cache_dir, crop_dir, bleed_dir):
+    """Remove cached, cropped, and bleed-preserved images."""
+    for d in [cache_dir, crop_dir, bleed_dir]:
         if os.path.exists(d):
             shutil.rmtree(d)
             print(f"Cleared {d}")
@@ -403,7 +446,8 @@ def main():
     # Resolve cache directories
     image_dir = os.path.join(args.cache_dir, "images") if args.cache_dir else os.path.join(os.getcwd(), "images")
     cache_dir = os.path.join(image_dir, "cache")
-    crop_dir = os.path.join(image_dir, "crop")
+    crop_dir  = os.path.join(image_dir, "crop")
+    bleed_dir = os.path.join(image_dir, "bleed")
 
     # Validate: need at least one of xml_file or --clear-cache
     if not args.xml_file and not args.clear_cache:
@@ -412,7 +456,7 @@ def main():
 
     # Handle --clear-cache
     if args.clear_cache:
-        clear_cache(cache_dir, crop_dir)
+        clear_cache(cache_dir, crop_dir, bleed_dir)
         if not args.xml_file:
             print("Cache cleared. No XML file provided; exiting.")
             return
@@ -450,14 +494,22 @@ def main():
     id_to_cached = download_all(fronts, backs, cache_dir)
 
     # 4. Crop / process
-    id_to_crop = crop_all(id_to_cached, args.dpi, args.vibrance, crop_dir)
+    id_to_crop = crop_all(
+        id_to_cached, args.dpi, args.vibrance, crop_dir,
+        keep_bleed=args.bleed, bleed_dir=bleed_dir,
+    )
 
-    # 4b. Crop cardback through same pipeline
+    # 4b. Process cardback through same pipeline
     os.makedirs(crop_dir, exist_ok=True)
+    if args.bleed:
+        os.makedirs(bleed_dir, exist_ok=True)
     vibrance_lut = load_vibrance_lut() if args.vibrance else None
     if cardback_path is not None:
         ext = os.path.splitext(cardback_path)[1]
-        cropped_cardback = crop_image(cardback_path, "cardback", ext, args.dpi, vibrance_lut, crop_dir)
+        cropped_cardback = crop_image(
+            cardback_path, "cardback", ext, args.dpi, vibrance_lut, crop_dir,
+            keep_bleed=args.bleed, bleed_dir=bleed_dir,
+        )
     else:
         cropped_cardback = None
 
@@ -466,10 +518,14 @@ def main():
     print(f"Total slots: {len(slot_list)}")
 
     # 6. Generate PDFs
+    bleed_pts = BLEED_PTS if args.bleed else 0.0
+    slot_w = CARD_W + 2 * bleed_pts
+    slot_h = CARD_H + 2 * bleed_pts
+
     page_size = PAGE_SIZES[args.paper]
     ps = (page_size[1], page_size[0]) if args.orientation == "landscape" else page_size
-    cols = int(ps[0] // CARD_W)
-    rows = int(ps[1] // CARD_H)
+    cols = int(ps[0] // slot_w)
+    rows = int(ps[1] // slot_h)
     cards_per_page = cols * rows
     remainder = len(slot_list) % cards_per_page
     if remainder != 0:
@@ -477,17 +533,23 @@ def main():
         print(f"Warning: {len(slot_list)} cards don't fill the last page "
               f"({empty} empty slot{'s' if empty != 1 else ''} on a {cards_per_page}-card page).")
 
+    if args.bleed:
+        print(f"Bleed mode: slots {slot_w/72:.2f}\"×{slot_h/72:.2f}\" "
+              f"({cols}×{rows}={cards_per_page} cards/page)")
+
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     out_dir = os.path.join(args.output, timestamp)
     os.makedirs(out_dir, exist_ok=True)
 
     fronts_pdf = os.path.join(out_dir, "fronts.pdf")
     print(f"Generating {fronts_pdf}...")
-    generate_pdf(fronts_pdf, slot_list, page_size, args.orientation, side="fronts")
+    generate_pdf(fronts_pdf, slot_list, page_size, args.orientation, side="fronts",
+                 bleed_pts=bleed_pts)
 
     backs_pdf = os.path.join(out_dir, "backs.pdf")
     print(f"Generating {backs_pdf}...")
-    generate_pdf(backs_pdf, slot_list, page_size, args.orientation, side="backs")
+    generate_pdf(backs_pdf, slot_list, page_size, args.orientation, side="backs",
+                 bleed_pts=bleed_pts)
 
     print(f"Done! PDFs saved to {out_dir}/")
 
